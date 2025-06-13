@@ -1,12 +1,16 @@
 from abc import ABC, abstractclassmethod
 import asyncio
+import aiohttp
+from dataclasses import asdict
 from contextlib import asynccontextmanager
 import logging
-from config import LoggerAdapter, AgentMetrics,AgentStatus
+from config import LoggerAdapter, AgentMetrics,AgentStatus, ScrapingTask,ScrapingResult
 from typing import Dict, List, Any, Optional, Callable
 import weakref
 import time
-# Base Agent class
+from datetime import datetime
+
+#============= Base Agent class===================
 
 class BaseAgent(ABC):
     def __init__(self, agent_id:str, correlation_id:str):
@@ -47,7 +51,7 @@ class BaseAgent(ABC):
 
 
 
-# Rate Limiter Agent
+#================== Rate Limiter Agent===================
 
 class RateLimiterAgent(BaseAgent):
     """limit on global rate limit and site limits"""
@@ -90,3 +94,331 @@ class RateLimiterAgent(BaseAgent):
 
                 self._request_times[site_name]=time.time()
                 yield # yield here is giving permission to the following request, remember this class is to acquire permission
+
+# =================the main scraper agent=======================   
+class ScraperAgent(BaseAgent):
+    def __init__(self, agent_id:str, correlation_id:str,
+                    rate_limiter:RateLimiterAgent, result_queue:asyncio.Queue):
+        super.__init__(agent_id, correlation_id)
+        self.rate_limiter=rate_limiter
+        self.result_queue=result_queue
+        self.task_queue=asyncio.Queue()
+        self.session: Optional[aiohttp.ClientSession]=None
+        self.metrics=AgentMetrics(
+            agent_id=agent_id,
+            status=AgentStatus.IDLE,
+            tasks_completed=0,
+            tasks_failed=0,
+            avg_response_time=0.0,
+            last_activity=datetime.now()
+        )
+        self._response_times=[]
+
+        # circuit breaker state
+        # the purpose of using circuit breaker is to prevent repeatedly retrying on a problematic sites due to downtime or mailfunction of their server
+        # to avoid resource wasting
+        self.failure_count=0
+        self.failure_threshold=5
+        self.recovery_timeout=60 #after 60 seconds, the scraper will try again
+        self.circuit_open=False #initial state is circuit closed, so scrapper can continuously scrape
+
+    async def start(self):
+        self.status=AgentStatus.RUNNING
+        self.session=aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=30),
+            connector=aiohttp.TCPConnector(limit=10,limit_per_host=5) #TCPConnector is used to reuse existing connections and reduce latency
+
+        )
+            
+        # start worker task
+        worker_task=asyncio.create_task(self._worker())
+        self._tasks.add(worker_task)
+
+        self.logger.info(f"Scraper agent {self.agent_id} started")
+
+    async def stop(self):
+        self.status=AgentStatus.STOPPED
+        if self.session:
+            await self.session.close()
+        self.logger.info(f"Scraper agent {self.agent_id} stopped")
+    
+    async def add_task(self, task: ScrapingTask):
+        """add a scraping task to the queue"""
+        await self.task_queue.put(task)
+    
+    def _is_circuit_open(self)-> bool:
+        """check if the circuit breaker is open"""
+        if not self.circuit_open:
+            return False
+        
+        if self.last_failure_time and time.time()-self.last_failure_time>self.recovery_timeout: 
+            # whenever the elapsed time bigger than the recovery_timeout, then circuit needs to try again to scrape
+            self.circuit_open=False
+            self.failure_count=0
+            self.logger.info("Circuit breaker reset")
+            return False
+        return True
+    
+    def _record_success(self, response_time:float):
+        """record successful request"""
+        self.failure_count=0
+        self.circuit_open=False
+        self.metrics.tasks_completed+=1
+        self._response_times.append(response_time)
+
+
+        # keep only last 100 response times for average calculation
+        if len(self._response_times)>100:
+            self._response_times.pop(0)
+        
+        self.metrics.avg_response_time=sum(self._response_times)/len(self._response_times)
+        self.metrics.last_activity=datetime.now()
+    
+    def _record_failure(self):
+        """record failed request"""
+        self.failure_count+=1
+        self.metrics.tasks_failed+=1
+        self.last_failure_time=time.time()
+        if self.failure_count>=self.failure_threshold:
+            self.circuit_open=True
+            self.logger.warning(f'Circuit breaker opened for agent {self.agent_id}')
+    
+    async def _scrape_with_retry(self,task:ScrapingTask)->ScrapingResult:
+        """scrape with exponential backoff retry"""
+        start_time=time.time()
+
+        for attempt in range (task.max_retires+1):
+            if self._shutdown_event.is_set():
+                raise asyncio.CancelledError
+            if self._is_circuit_open():
+                return ScrapingResult(
+                    task_id=task.task_id,
+                    site_name=task.site_name,
+                    url=task.url,
+                    data=None,
+                    error="Circuit breaker open",
+                    timestamp=datetime.now(),
+                    duration=time.time()-start_time
+
+                )
+            try:
+                async with self.rate_limiter.acquire_permit(task.site_name):
+                    async with self.session.get(task.url) as response:
+                        if response.status==200:
+                            # simulate data extraction
+                            data={
+                                "title":f"Product from {task.site_name}",
+                                "price": "$99.99",
+                                "status_code":response.status,
+                                "scraped_at":datetime.now().isoformat()
+
+                            }
+                            duration=time.time()-start_time
+                            self._record_success(duration)
+
+                            return ScrapingResult(
+                                task_id=task.task_id,
+                                site_name=task.site_name,
+                                url=task.url,
+                                data=data,
+                                error=None,
+                                timestamp=datetime.now(),
+                                duration=duration
+                            )
+                        else:
+                            raise aiohttp.ClientConnectionError(
+                                request_info=response.request_info,
+                                history=response.history,
+                                status=response.status
+                            )
+
+            except asyncio.CancelledError:
+                raise 
+            except Exception as e:
+                self.logger.warning(f"Attempt {attempt+1} failed for {task.url}:{str(e)}")
+                if attempt<task.max_retires:
+                    # exponential backoff with jitter
+                    delay=(2**attempt)+(time.time()%1)
+                    await asyncio.sleep(delay)
+                else:
+                    self._record_failure()
+                    return ScrapingResult(
+                        task_id=task.task_id,
+                        site_name=task.site_name,
+                        url=task.url,
+                        data=None,
+                        error=str(e),
+                        timestamp=datetime.now(),
+                        duration=time.time()-start_time
+                    )
+    async def _worker(self):
+        """main worker loop"""
+        while not self._shutdown_event.is_set():
+            try:
+                # wait for task with timeout to allow shutdown
+                task=await asyncio.wait_for(self.task_queue.get(),
+                                            timeout=1.0)
+                self.logger.info(f"Processing task {task.task_id} for {task.site_name}")
+                result=await self._scrape_with_retry(task)
+                await self.result_queue.put(result)
+            
+            except asyncio.TimeoutError:
+                continue
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.logger.error(f"Worker error: {str(e)}")
+        
+
+# ===================Progress Reporter Agent===============
+
+class ProgressReporterAgent(BaseAgent):
+    """report fail and completed tasks"""
+    def __init__(self, agent_id: str, correlation_id: str, result_queue:asyncio.Queue, agents:List[ScraperAgent]):
+        super().__init__(agent_id, correlation_id)
+        self.result_queue=result_queue
+        self.agents=agents
+        self.total_tasks=0
+        self.completed_tasks=0
+        self.failed_tasks=0
+        self.results=[]
+
+    async def start(self):
+        self.status=AgentStatus.RUNNING
+
+        # start progress reporter
+        processor_task=asyncio.create_task(self._process_results())
+        self._tasks.add(processor_task)
+
+        self.logger.info("Progress reproter started")
+
+    async def stop(self):
+        self.status=AgentStatus.STOPPED
+        self.logger.info("Progress reporter stopped")
+
+    def set_total_tasks(self,total:int):
+        self.total_tasks=total
+    
+    async def _process_results(self):
+        """process scraping results"""
+
+        while not self._shutdown_event.is_set():
+            try:
+                # wait for the results get collected for a second
+                result=await asyncio.wait_for(
+                    self.result_queue.get(),
+                    timeout=1.0
+                )
+                if result.error:
+                    self.failed_tasks+=1
+                    self.logger.error(f"Task {result.task_id} failed: {result.error}")
+                else:
+                    self.completed_tasks+=1
+                    self.logger.info(f"Task {result.task_id} completed successfully")
+            except asyncio.TimeoutError:
+                continue
+            
+            except asyncio.CancelledError:
+                break
+    
+    async def _report_progress(self):
+        """report progress periodically"""
+
+        while not self._shutdown_event.is_set():
+            try:
+                await asyncio.sleep(5)
+                progress={
+                    "total_tasks":self.total_tasks,
+                    "completed_tasks":self.completed_tasks,
+                    "failed_tasks": self.failed_tasks,
+                    "progress_percentage": (self.completed_tasks+self.failed_tasks)/max(self.total_tasks,1)*100,
+                    "agent_metrics": [asdict(agent.metrics) for agent in self.agents],
+                    "timestamp":datetime.now().isoformat
+                }
+
+                self.logger.info(f'Progress:{progress['progress_percentage']:.1f}%'
+                                 f"({self.completed_tasks}/{self.total_tasks} completed, "
+                                 f"{self.failed_tasks} failed)"
+                                 )
+            except asyncio.CancelledError:
+                break
+
+
+# ========Agent Manager: Main coordinator=========
+
+class AgentManager:
+    def __init__(self, correlation_id:str, num_scrapers:int=3):
+        self.correlation_id=correlation_id
+        self.logger=LoggerAdapter(
+            logging.getLogger(self.__class__.__name__),
+            {'correlation_id':correlation_id}
+        )
+        
+        # initialize agents
+        self.result_queue=asyncio.Queue()
+        self.rate_limiter=RateLimiterAgent(
+            "rate_limiter",
+            correlation_id,
+            global_rate_limit=10,
+            site_limits={"amazon.com":2,
+                         "ebay.com":3,
+                         "etsy.com":5}
+             
+        )
+        self.scrapers=[
+            ScraperAgent(
+                f"scraper_{i}",correlation_id,
+                self.rate_limiter,
+                self.result_queue
+            )
+            for i in range(num_scrapers)
+        ]
+        self.progress_reporter=ProgressReporterAgent(
+            "progress_reporter",
+            correlation_id,
+            self.result_queue,
+            self.scrapers
+        )
+
+        self.all_agents=[self.rate_limiter]+self.scrapers+[self.progress_reporter]
+
+    async def start_all_agents(self):
+        self.logger.info("Starting all agents...")
+        start_tasks=[agent.start() for agent in self.all_agents]
+        await asyncio.gather(*start_tasks)
+        self.logger.info("All agents started successfully")
+
+    
+    async def stop_all_agents(self):
+        """stop all agents gracefully"""
+        self.logger.info("Stopping all agents...")
+
+        # signal shutdown to all agents
+        shutdown_tasks=[agent.shutdown() for agent in self.all_agents]
+        await asyncio.gather(*shutdown_tasks, return_exceptions=True)
+
+        self.logger.info("All agetns stopped")
+
+    async def execute_scraping_job(self, tasks: List[ScrapingTask])->List[ScrapingResult]:
+        """execte a batcg if scraping tasks"""
+
+        try:
+            await self.start_all_agents()
+            self.progress_reporter.set_total_tasks(len(tasks))
+            self.logger.info(f"Starting scraping job with {len(tasks)} tasks")
+
+            # distribute tasks among scrapers
+            for i, task in enumerate(tasks):
+                scraper=self.scrapers[i % len(self.scrapers)]
+                await scraper.add_task(task)
+            # wait for all tasks to complete
+            while (self.progress_reporter.completed_tasks + self.progress_reporter.failed_tasks)<len(tasks):
+                await asyncio.sleep(1)
+            self.logger.info("All tasks completed")
+            return self.progress_reporter.results
+        
+        except Exception as e:
+            self.logger.error(f"Job execution failed:{str(e)}")
+            raise
+        finally:
+            await self.stop_all_agents()
