@@ -1,0 +1,14 @@
+{
+  "task_id": "task_etsy_3",
+  "site_name": "etsy.com",
+  "url": "https://www.etsy.com/r/themes/1314285282186",
+  "data": {
+    "title": "Product from etsy.com",
+    "price": "$99.99",
+    "status_code": 200,
+    "scraped_at": "2025-06-16T10:44:39.127626"
+  },
+  "error": null,
+  "timestamp": "2025-06-16T10:44:39.127626",
+  "duration": 4.926666498184204
+}
